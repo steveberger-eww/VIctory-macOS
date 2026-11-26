@@ -142,6 +142,9 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })?;
 
@@ -1243,6 +1246,9 @@ fn lower_cs32_with(
         mesh_stride: 0,
         atomic_locks,
         bias_as_gradients: super::host::under_wine(),
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })
     .expect("lower");

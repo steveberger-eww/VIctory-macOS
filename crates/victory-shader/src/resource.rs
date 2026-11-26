@@ -1172,8 +1172,25 @@ impl<'a> Tracer<'a> {
                     .collect();
                 self.classify(&edge, joins, known)
             })
-            .collect::<Result<_, _>>();
+            .collect::<Vec<_>>();
         joins.pop();
+        // A descriptor the compiler builds from constants inside a per-lane
+        // branch and reads after it: on the edge that skipped the branch its
+        // registers hold something else (user data), which no lane that reads
+        // the descriptor brings. That edge takes the built one.
+        // shortcut: taken from the words alone, not from which lanes read.
+        const NEITHER: &str = "a descriptor neither loaded nor built";
+        let built = args.iter().find_map(|a| match a {
+            Ok(s @ Source::Constant(_)) => Some(s.clone()),
+            _ => None,
+        });
+        let args = args
+            .into_iter()
+            .map(|a| match (a, &built) {
+                (Err(NEITHER), Some(b)) => Ok(b.clone()),
+                (a, _) => a,
+            })
+            .collect::<Result<_, _>>();
         Ok(Some(Source::Phi { block, args: args? }))
     }
 
@@ -3079,6 +3096,42 @@ pub(crate) mod tests {
         let p = crate::ir::build(&code, wave64, 256).unwrap();
         let layout = [param(Table, 0, 1), param(Table, 1, 1)];
         track(&p, &layout, HwStage::Cs, lanes(&p).as_ref())
+    }
+
+    /// A sampler the compiler builds from constants inside a per-lane branch
+    /// (`if (tid < 8)`) and samples with after it, as the title's alpha
+    /// resolve does: on the edge that skipped the branch s[8:11] hold what
+    /// they held on entry. Traced as the built sampler on both edges.
+    #[test]
+    fn a_sampler_built_in_a_branch_and_read_after_it_is_the_built_one() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0088, // v_cmp_gt_u32_e32 vcc, 8, v0
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0005, // s_cbranch_execz skip
+            0xB008_0092, // s_movk_i32 s8, 0x92
+            0xBE89_03FF,
+            0x00C0_0000, // s_mov_b32 s9, 0xc00000
+            0xBE8A_0BA8, // s_brev_b32 s10, 40
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x887E_157E, // skip: s_or_b32 exec_lo, exec_lo, s21
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0xBF81_0000, // s_endpgm
+        ];
+        let r = waterfall(&words, false).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        let Source::Phi { args, .. } = &sampler.source else {
+            panic!("{:?}", sampler.source)
+        };
+        assert!(args.iter().all(|a| matches!(a, Source::Constant(_))), "{args:?}");
+        assert!(args.windows(2).all(|w| w[0] == w[1]), "{args:?}");
     }
 
     #[test]

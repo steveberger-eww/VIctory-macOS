@@ -43,13 +43,19 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// Lock words of emulated 64-bit image atomics, past the bitmap in the
 /// same buffer (`emit`, "Atomic locks"); a power of two.
 pub const ATOMIC_LOCKS: u32 = 1 << 16;
-/// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the bitmap, then
-/// the lock words.
-pub const VIEW_WRITES_BYTES: u32 = VIEW_WRITE_BITS / 8 + 4 * ATOMIC_LOCKS;
+/// Where, in the buffer bound at `u`[`VIEW_WRITES`], the read marks of
+/// textures start: a bit per resource-heap slot, set by a shader that found
+/// the slot's texture empty (`emit`, "Read marks").
+pub const READ_MARKS_AT: u32 = VIEW_WRITE_BITS / 8 + 4 * ATOMIC_LOCKS;
+/// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the bitmap, the
+/// lock words, then the read marks.
+pub const VIEW_WRITES_BYTES: u32 = READ_MARKS_AT + HEAP_VIEWS / 8;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types, and that they are 16 bits wide (not minimum precision).
+    pub const LOW_PRECISION: u64 = 1 << 5 | 1 << 23;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const ROVS: u64 = 1 << 18;
@@ -805,6 +811,10 @@ impl Shader {
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
+        let elements = || self.inputs.iter().chain(&self.outputs).chain(&self.prims);
+        if elements().any(|e| e.comp == 8) {
+            self.flags |= flags::LOW_PRECISION;
+        }
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
@@ -877,6 +887,16 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // Not in a geometry shader, whose stores belong before the
+        // `emitStream` that follows them.
+        if self.gs.is_none() {
+            self.m.calls_last(&[
+                "dx.op.storeOutput",
+                "dx.op.storeVertexOutput",
+                "dx.op.storePrimitiveOutput",
+            ]);
+        }
+        self.m.reduce();
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
@@ -899,6 +919,9 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        if self.flags & flags::LOW_PRECISION != 0 {
+            features |= 0x80000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

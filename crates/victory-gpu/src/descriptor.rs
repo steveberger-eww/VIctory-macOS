@@ -198,6 +198,64 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Makes the textures of the view-heap slots shaders found empty
+/// (`victory_shader::emit`, "Read marks"): the title's shaders take most
+/// textures at heap indices they read from memory, which no draw names, and
+/// a view of a texture the title placed itself is otherwise left null
+/// ([`host::HostHeap::mirror`]). After a submission; the textures are there
+/// for the next frame.
+#[cfg(windows)]
+pub(crate) fn make_read_textures() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    /// Where the last call stopped, so that every slot gets its turn.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut slots = crate::shadow::take_read_marks();
+    if slots.is_empty() {
+        return;
+    }
+    // A few milliseconds' worth per submission: the world's first frames
+    // mark thousands of slots, and making them all at once held a frame for
+    // seconds (the title's GPU watchdog then ended the run). A slot not
+    // reached is marked again by the next frame's shaders.
+    let next = NEXT.load(Relaxed) as u32;
+    let first = slots.partition_point(|&i| i < next);
+    slots.rotate_left(first);
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(4);
+    let mut made = 0u64;
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &index in &slots {
+        if started.elapsed() > budget {
+            break;
+        }
+        for &(start, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+                continue;
+            };
+            if heap.desc.kind != 0 || index >= heap.desc.count {
+                continue;
+            }
+            let handle = start + u64::from(index) * u64::from(step);
+            // The title unmaps heap pages too.
+            if crate::host::read_into(handle as *const u8, &mut [0u8; 12]) {
+                host.mirror(index, handle, true);
+            }
+        }
+        made += 1;
+        NEXT.store(u64::from(index) + 1, Relaxed);
+    }
+    if made == slots.len() as u64 {
+        NEXT.store(0, Relaxed);
+    }
+    let before = MADE.fetch_add(made, Relaxed);
+    if before >> 8 != (before + made) >> 8 {
+        tracing::info!(slots = before + made, waiting = slots.len() as u64 - made, "heap slots shaders found empty, their textures made so far");
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

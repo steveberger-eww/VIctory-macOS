@@ -195,6 +195,9 @@ fn build(
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })
     .expect("lower");

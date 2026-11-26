@@ -145,6 +145,13 @@
 //!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
 //!   index, two dwords, the buffer view's title address (high dword bits
 //!   0-15; stride bits 0), zeros for no buffer view.
+//! * **Read marks** (with [`Options::view_marks`]; added 2026-11-26): the
+//!   title's shaders take most textures from the heap at indices they read
+//!   from memory, so no draw names them, and the host cannot make a texture
+//!   for every view the title has (some 20,000). A shader that finds the
+//!   texture of a heap slot empty (width 0) sets the slot's bit past
+//!   [`READ_MARKS_AT`] in the buffer at `u`[`VIEW_WRITES`]; the host makes
+//!   the marked slots' textures after the submission, for the next frame.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -230,8 +237,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    ATOMIC_LOCKS, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    VIEW_WRITES_BYTES,
+    ATOMIC_LOCKS, READ_MARKS_AT, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES, VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -376,6 +383,28 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// The host runs 32-lane waves only, and a program that needs the
+    /// console's 64 (cross-lane reads, lane masks as numbers, one wave
+    /// sharing LDS without barriers) is refused. D3DMetal reports 32 lanes,
+    /// accepts a `WaveSize(64)` pipeline and runs nothing in it (every
+    /// output left as it was), so the pass vanished without a trace;
+    /// refused, it is logged with the other untranslated shaders.
+    pub wave32_host: bool,
+    /// With [`wave32_host`](Self::wave32_host): a wave64 program that reads
+    /// other lanes runs anyway, each console wave as two 32-lane host waves
+    /// (halves) keeping console lane numbers. A ballot holds only the own
+    /// half's lanes and a read of the other half gets the own half's lane,
+    /// as if the other half were inactive.
+    /// shortcut: approximate (reductions, prefixes and counts cover a half,
+    /// LDS slots indexed by console wave are shared by both halves); opt-in
+    /// (`VICTORY_WAVE64_HALVES=1`) until a groupshared exchange replaces it.
+    pub wave64_halves: bool,
+    /// Vertex and mesh outputs of 16-bit floats, and the pixel inputs they
+    /// feed, are declared 16-bit on the host too (else 32-bit, converted on
+    /// the way). Metal allows a mesh shader 32 KB of outputs for all its
+    /// vertices and primitives, and 53 of the world's mesh pipelines were
+    /// over it with every half taking a float's room (D3DMetal).
+    pub half_io: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -502,6 +531,9 @@ pub fn emit_with(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
+        wave32_host: options.wave32_host,
+        wave64_halves: options.wave32_host && options.wave64_halves,
+        half_io: options.half_io,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

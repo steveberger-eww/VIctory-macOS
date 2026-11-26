@@ -54,7 +54,9 @@ say "building the x86_64 libraries Wine needs (about 10 minutes the first time)"
 tools/macos/build-deps.sh "$ALIAS/target/deps-x86"
 
 # 5. CrossOver Wine.
-if [[ -x $WINE_DIR/bin/wine ]]; then
+# A Wine built before SDL2 was added cannot read PlayStation or Switch pads,
+# so it is built again.
+if [[ -x $WINE_DIR/bin/wine && -f $WINE_DIR/lib/libSDL2-2.0.0.dylib ]]; then
   say "Wine already built"
 else
   say "building CrossOver Wine (about 30 minutes the first time)"
@@ -62,7 +64,11 @@ else
 fi
 
 # 6. D3DMetal from Apple's Game Porting Toolkit.
-if [[ -d $WINE_DIR/lib/external/D3DMetal.framework ]]; then
+# Rebuilding Wine installs its own d3d11, d3d12 and dxgi over D3DMetal's
+# while leaving the framework in place, so the DLL is checked as well: only
+# Wine's own d3d11 imports wined3d.
+if [[ -d $WINE_DIR/lib/external/D3DMetal.framework ]] &&
+   ! grep -qi "wined3d.dll" "$WINE_DIR/lib/wine/x86_64-windows/d3d11.dll"; then
   say "D3DMetal already added"
 else
   dmg="${GPTK_DMG:-$(ls -t "$HOME"/Downloads/Game_Porting_Toolkit*.dmg 2> /dev/null | head -n 1)}"

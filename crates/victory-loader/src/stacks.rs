@@ -41,11 +41,13 @@ pub fn dump_stacks_on_schedule() {
     });
     // Room for every thread id, made before any dump.
     let mut ids: Vec<u32> = Vec::with_capacity(8192);
+    // `VICTORY_STACKS_BUSY=1`: the dumps as a sampling profile (see `Busy`).
+    let mut busy = (std::env::var("VICTORY_STACKS_BUSY").as_deref() == Ok("1")).then(Busy::default);
     std::thread::spawn(move || {
         for at in times {
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             match &raw {
-                Some(file) => dump_raw(file, at.as_secs(), &mut ids),
+                Some(file) => dump_raw(file, at.as_secs(), &mut ids, busy.as_mut()),
                 None => dump_stacks(),
             }
         }
@@ -98,9 +100,20 @@ fn modules(file: &std::fs::File) {
     unsafe { CloseHandle(snapshot) };
 }
 
+/// For many dumps read as a sampling profile: after the first four, only
+/// the threads whose top frame differed between dumps are dumped. The rest
+/// wait, and leaving them out takes a dump of a title's hundred-odd threads
+/// from over a second to a fraction of one.
+#[derive(Default)]
+struct Busy {
+    dumps: u32,
+    /// By thread: its top frame in the last dump, and whether it ever changed.
+    tops: std::collections::HashMap<u32, (u64, bool)>,
+}
+
 /// [`dump_stacks`] into `file`, with a line before each step, so a dump
 /// that stops shows where.
-fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
+fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>, mut busy: Option<&mut Busy>) {
     line(file, format_args!("dump at {at} s: taking a thread snapshot"));
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
@@ -125,6 +138,12 @@ fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    if let Some(b) = busy.as_mut() {
+        b.dumps += 1;
+        if b.dumps > 4 {
+            ids.retain(|id| b.tops.get(id).is_some_and(|t| t.1));
+        }
+    }
     line(file, format_args!("dump at {at} s: {} threads", ids.len()));
     for &id in ids.iter() {
         line(file, format_args!("  thread {id}: opening"));
@@ -137,6 +156,11 @@ fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
         }
         line(file, format_args!("  thread {id} start {:#x}", start_of(thread)));
         let (frames, (priority, base)) = frames_of(thread);
+        if let Some(b) = busy.as_mut() {
+            let top = frames.first().copied().unwrap_or(0);
+            let seen = b.tops.entry(id).or_insert((top, false));
+            *seen = (top, seen.1 || seen.0 != top);
+        }
         line(file, format_args!("  thread {id} priority {priority} (base {base}), {} frames", frames.len()));
         for (i, pc) in frames.into_iter().enumerate() {
             line(file, format_args!("    #{i:<2} {pc:#x}"));

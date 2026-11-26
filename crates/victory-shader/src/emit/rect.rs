@@ -31,10 +31,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for k in 0..3u32 {
         let mut values = Vec::new();
         for (id, e) in elements.iter().enumerate() {
-            let (ty, suffix) = if e.comp == 9 {
-                (s.t.f32, ".f32")
-            } else {
-                (s.t.i32, ".i32")
+            let (ty, suffix) = match e.comp {
+                8 => (s.m.half(), ".f16"),
+                9 => (s.t.f32, ".f32"),
+                _ => (s.t.i32, ".i32"),
             };
             let mut comps = Vec::new();
             for col in 0..e.cols {
@@ -52,7 +52,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             (0..usize::from(e.cols))
                 .map(|col| {
                     let [v0, v1, v2] = [0, 1, 2].map(|k| corners[k][id][col]);
-                    if e.comp == 9 {
+                    if e.comp >= 8 {
                         let sum = s.m.bin(b, Bin::Add, v0, v2);
                         s.m.bin(b, Bin::Sub, sum, v1)
                     } else {
@@ -66,7 +66,11 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for triangle in [[0, 1, 2], [0, 2, 3]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
-                let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
+                let suffix = match e.comp {
+                    8 => ".f16",
+                    9 => ".f32",
+                    _ => ".i32",
+                };
                 for col in 0..e.cols {
                     let v = corners[k][id][usize::from(col)];
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];

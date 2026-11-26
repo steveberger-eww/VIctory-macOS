@@ -147,10 +147,20 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
+    let host = crate::pipeline::host_pipeline(pipeline as This).is_some();
+    if why.is_empty() && host {
+        // A path that set no reason: named by its shaders.
+        crate::pipeline::note_why(format!(
+            "{kind}: no reason noted {}",
+            crate::pipeline::shaders_of(pipeline as This)
+        ));
+    } else if why.is_empty() || !host {
         crate::pipeline::note_drop(pipeline as This);
     } else {
-        crate::pipeline::note_why(format!("{kind}: {why}"));
+        crate::pipeline::note_why(format!(
+            "{kind}: {why} {}",
+            crate::pipeline::shaders_of(pipeline as This)
+        ));
     }
     list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
@@ -644,23 +654,58 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                Some(&Root::View(0)) => Err("a root view at address 0"),
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
+                                    .and_then(|s| u32::try_from(s.offset(address)).ok())
+                                    .ok_or("a root view's address in no title copy"),
+                                Some(Root::None) | None => Err("a root view the title did not set"),
+                                Some(_) => Err("a root view set as a table or constants"),
                             };
+                            #[cfg(feature = "diagnostics")]
+                            if offset.is_err() {
+                                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                                if !seen.contains(&stage.shader.hash) {
+                                    seen.push(stage.shader.hash.clone());
+                                    let roots = self.roots_ref(compute);
+                                    let kinds: Vec<String> = roots
+                                        .iter()
+                                        .map(|r| match r {
+                                            Root::None => "-".into(),
+                                            Root::Table(_) => "T".into(),
+                                            Root::Constants(c) => format!("C{}", c.len()),
+                                            Root::View(_) => "V".into(),
+                                        })
+                                        .collect();
+                                    tracing::info!(
+                                        hash = %stage.shader.hash,
+                                        slot = u.slot,
+                                        index = u.index,
+                                        roots = ?kinds,
+                                        layout = ?t.used.iter().map(|r| (r.slot, r.root, r.kind)).collect::<Vec<_>>(),
+                                        "a root view offset with no view at its slot"
+                                    );
+                                }
+                            }
                             match offset {
-                                Some(offset) => offset,
-                                None => return false,
+                                Ok(offset) => offset,
+                                Err(why) => {
+                                    not_run(why);
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
                             match self.root_view(list, compute, u.slot, uav) {
                                 Some((slot, _)) => slot,
-                                None => return false,
+                                None => {
+                                    not_run("a root view with no host view");
+                                    return false;
+                                }
                             }
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -1838,6 +1883,15 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// Whether `u` takes a root view's offset in its host copy. Only a root
+/// descriptor's entry: root constants number their dwords from 0, and their
+/// fifth (dword 4) is plain data. Matching the dword alone dropped every
+/// dispatch with five or more root constants and a root view, 174 per frame
+/// in Grand Theft Auto VI's world (26 November 2026).
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -1874,6 +1928,16 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dword 4 of root constants is data, not a root view's offset.
+    #[test]
+    fn only_root_descriptors_take_a_view_offset() {
+        use victory_shader::emit::{ROOT_VIEW_OFFSET, UserData};
+        let at = |root| UserData { index: 24, slot: 2, root, dword: ROOT_VIEW_OFFSET };
+        assert!(is_root_view_offset(&at(RootType::Descriptor)));
+        assert!(!is_root_view_offset(&at(RootType::Constants)));
+        assert!(!is_root_view_offset(&at(RootType::Table)));
+    }
     use crate::object::{HRESULT, S_OK};
     use crate::compute::{Param, srv, uav};
     use windows::core::s;

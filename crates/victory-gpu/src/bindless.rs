@@ -300,6 +300,8 @@ pub(crate) fn forget(resource: usize) {
 pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
+    tracing::info!("{}", crate::shadow::breakdown());
+    tracing::info!("{}", crate::resource::placed_summary());
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());

@@ -15,6 +15,8 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 16-bit float.
+    Half,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -92,6 +94,7 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -232,6 +235,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -528,6 +534,76 @@ impl Module {
         live
     }
 
+    /// Moves the calls of functions whose names start with one of
+    /// `prefixes` to the end of their blocks, keeping their order.
+    ///
+    /// For output stores: Apple's DXIL converter (D3DMetal 4.0b3) builds an
+    /// output element's vector where the element is first stored, from the
+    /// values all its components are stored with. One computed after that
+    /// first store (a conversion between two stores) is then used before
+    /// its definition, and Apple's compiler reads garbage or crashes in its
+    /// register allocator (361 mesh pipelines in the world, the peds' heads
+    /// among them).
+    pub fn calls_last(&mut self, prefixes: &[&str]) {
+        let moved = |m: &Self, i: u32| {
+            matches!(&m.insts[i as usize].op, Op::Call(f, _)
+                if prefixes.iter().any(|p| m.funcs[*f as usize].name.starts_with(p)))
+        };
+        for b in 0..self.blocks.len() {
+            let body = std::mem::take(&mut self.blocks[b].body);
+            let (last, mut first): (Vec<u32>, Vec<u32>) = body.into_iter().partition(|&i| moved(self, i));
+            first.extend(last);
+            self.blocks[b].body = first;
+        }
+    }
+
+    /// Diagnostics, for bisecting a host-compiler crash down to the pattern
+    /// behind it (`tools/macos/reduce-crash.py` drives it): with
+    /// `VICTORY_REDUCE=<file>`, the number of candidates (the scalar and void
+    /// body instructions of a module with over 200 of them, in block order)
+    /// goes to `<file>.n`, and every candidate whose number `<file>` lists
+    /// becomes zero (a void one is dropped).
+    pub fn reduce(&mut self) {
+        let Ok(path) = std::env::var("VICTORY_REDUCE") else {
+            return;
+        };
+        let scalar = |m: &Self, i: u32| {
+            matches!(
+                m.types[m.insts[i as usize].ty.0 as usize],
+                TypeDef::Int(_) | TypeDef::Float | TypeDef::Void
+            )
+        };
+        let cands: Vec<u32> = (self.blocks.iter())
+            .flat_map(|b| b.body.iter().copied())
+            .filter(|&i| scalar(self, i))
+            .collect();
+        if cands.len() <= 200 {
+            return;
+        }
+        let _ = std::fs::write(format!("{path}.n"), cands.len().to_string());
+        let listed = std::fs::read_to_string(&path).unwrap_or_default();
+        let kill: std::collections::HashSet<u32> = (listed.split_whitespace())
+            .filter_map(|n| cands.get(n.parse::<usize>().ok()?).copied())
+            .collect();
+        for &i in &kill {
+            let ty = self.insts[i as usize].ty;
+            let zero = match self.types[ty.0 as usize] {
+                TypeDef::Void => continue,
+                TypeDef::Float => self.f32(0),
+                _ => self.int_const(ty, 0),
+            };
+            let yes = self.bool(true);
+            self.insts[i as usize].op = Op::Select(yes, zero, zero);
+        }
+        let void = |m: &Self, i: u32| m.types[m.insts[i as usize].ty.0 as usize] == TypeDef::Void;
+        for b in 0..self.blocks.len() {
+            let body = std::mem::take(&mut self.blocks[b].body);
+            self.blocks[b].body = (body.into_iter())
+                .filter(|&i| !(kill.contains(&i) && void(self, i)))
+                .collect();
+        }
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -561,6 +637,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -1024,6 +1101,29 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_stores_go_last_in_their_block() {
+        let mut m = Module::default();
+        let (void, i32t) = (m.void(), m.int(32));
+        let fty = m.func_ty(void, vec![i32t]);
+        m.ptr(fty);
+        let store = m.function("dx.op.storeOutput.i32", fty, None, false);
+        let b = m.new_block();
+        let one = m.i32(1);
+        let first = m.bin(b, Bin::Add, one, one);
+        m.call(b, store, vec![first]);
+        let second = m.bin(b, Bin::Add, first, one);
+        m.call(b, store, vec![second]);
+        m.calls_last(&["dx.op.storeOutput"]);
+        let stored: Vec<Option<V>> = (m.blocks[b].body.iter())
+            .map(|&i| match &m.insts[i as usize].op {
+                Op::Call(_, args) => Some(args[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stored, [None, None, Some(first), Some(second)]);
+    }
 
     #[test]
     fn vbr_and_blocks() {

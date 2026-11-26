@@ -3,12 +3,12 @@
 # for x86_64 under Rosetta and installs it into target/wine-cx. D3DMetal is
 # made for this Wine, and its memory APIs are new enough for VIctory.
 #
-# DEPS names an x86_64 prefix with FreeType and GnuTLS, such as the
-# build/deps folder of the Minecraft Bedrock macOS setup.
+# DEPS names an x86_64 prefix with FreeType, GnuTLS and SDL2, as
+# tools/macos/build-deps.sh builds.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
-DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
+DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType, GnuTLS and SDL2}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
 # them keep every path in the build free of spaces.
@@ -18,7 +18,8 @@ ln -sfn "$ROOT/target" "$ALIAS/target"
 # The deps are copied, and each library's recorded path is pointed at the
 # copy, because a prefix built elsewhere may record a folder that is gone.
 DEPS="$ALIAS/target/deps"
-if [[ ! -f $DEPS/.relinked ]]; then
+# A copy made before SDL2 was added is made again.
+if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   rm -rf "$DEPS"
   ditto "$DEPS_REAL" "$DEPS"
   for lib in "$DEPS"/lib/*.dylib(.N); do
@@ -59,8 +60,23 @@ if ! grep -q 'victory-macos fallback' "$VK"; then
   mv "$VK.new" "$VK"
 fi
 
+# With SDL, winebus presents PlayStation, Switch and other pads to XInput
+# with the Xbox layout. Wine wants PlayStation pads raw from a hidraw bus
+# instead (IOHID here), drops SDL's copy of them, and on macOS never marks
+# the raw copy as a gamepad, so XInput saw no pad. Hidraw is therefore off
+# while SDL runs. It is turned off before the SDL bus starts, because the
+# first pads arrive before its start returns, and back on if SDL fails to
+# load. With SDL off, IOHID would also list every pad a second time, and an
+# Xbox pad would take two XInput slots. `Enable SDL` = 0 in the registry
+# brings back IOHID.
+BUS="$SRC/dlls/winebus.sys/main.c"
+if ! grep -q 'victory-macos sdl first' "$BUS"; then
+  perl -0pi -e 's/\n        if \(!sdl_driver_init\(\)\) options\.disable_input = TRUE;\n/\n        \/* victory-macos sdl first *\/\n        {\n            BOOL disable_hidraw = options.disable_hidraw;\n            options.disable_hidraw = TRUE;\n            if (!sdl_driver_init()) options.disable_input = TRUE;\n            else options.disable_hidraw = disable_hidraw;\n        }\n/ or die "sdl_driver_init call not found\n"' "$BUS"
+fi
+
 cd "$OBJ"
-if [[ ! -f Makefile ]]; then
+# A build configured before SDL2 was added is configured again.
+if [[ ! -f Makefile ]] || ! grep -q '^#define SONAME_LIBSDL2' include/config.h; then
   echo "configuring CrossOver Wine"
   # The prefix has spaces in it, so autoconf's default site file path would
   # be split at the first one. No site file is needed.
@@ -71,14 +87,16 @@ if [[ ! -f Makefile ]]; then
     PKG_CONFIG_PATH="$DEPS/lib/pkgconfig" \
     FREETYPE_CFLAGS="-I$DEPS/include/freetype2" FREETYPE_LIBS="-L$DEPS/lib -lfreetype" \
     GNUTLS_CFLAGS="-I$DEPS/include" GNUTLS_LIBS="-L$DEPS/lib -lgnutls" \
-    --without-gstreamer --without-sdl --without-cups --without-sane --without-krb5 \
+    SDL2_CFLAGS="-I$DEPS/include/SDL2 -D_THREAD_SAFE" SDL2_LIBS="-L$DEPS/lib -lSDL2" \
+    --without-gstreamer --without-cups --without-sane --without-krb5 \
     --without-netapi --without-pcap --without-usb --without-v4l2 --without-capi \
     --without-gphoto --without-x --without-wayland --without-pulse --without-alsa \
     --without-oss --without-udev --without-inotify --without-vulkan --without-opencl \
     --without-ffmpeg > configure.log 2>&1 || { tail -20 configure.log; exit 1; }
+  grep -q '^#define SONAME_LIBSDL2' include/config.h || { grep -i sdl configure.log; echo "configure did not find SDL2 in $DEPS" >&2; exit 1; }
 fi
 echo "building CrossOver Wine"
 x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
 x86 make install > install.log 2>&1
-cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
+cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6,SDL2-2.0.0}.dylib "$PREFIX/lib/"
 echo "installed in $PREFIX"

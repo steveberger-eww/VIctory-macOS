@@ -181,6 +181,9 @@ fn program() -> HostShader {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })
     .expect("lower");
@@ -409,6 +412,9 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })
     .expect("lower");
@@ -553,6 +559,9 @@ fn writes_through_views_mark_their_pages() {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: true,
     })
     .expect("lower");

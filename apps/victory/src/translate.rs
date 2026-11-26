@@ -488,6 +488,23 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
+    // `VICTORY_DUMP_CONTAINERS=<dir>` with `VICTORY_DUMP_MATCH=<substrings,>`:
+    // the containers whose label holds one, as files (for `shader-info
+    // --disasm`). Game-derived: the folder must be outside the repository.
+    if let (Some(dir), Ok(m)) = (
+        std::env::var_os("VICTORY_DUMP_CONTAINERS"),
+        std::env::var("VICTORY_DUMP_MATCH"),
+    ) {
+        // Labels, or the hash the run log names shaders by.
+        let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+        let label = format!("{} {hash}", example());
+        if m.split(',').any(|m| !m.is_empty() && label.contains(m)) {
+            let name: String =
+                example().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let name = &name[name.len().saturating_sub(80)..];
+            let _ = std::fs::write(Path::new(&dir).join(format!("{hash}_{name}.bin")), &bytes);
+        }
+    }
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
@@ -568,7 +585,17 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, ..Default::default() };
+                    // VICTORY_WAVE32_HOST=1: as for a 32-lane host (D3DMetal),
+                    // which refuses wave64 programs that need 64 lanes.
+                    let marks = emit::Options {
+                        view_marks: true,
+                        wave32_host: std::env::var("VICTORY_WAVE32_HOST").as_deref() == Ok("1"),
+                        wave64_halves: std::env::var("VICTORY_WAVE64_HALVES").as_deref() == Ok("1"),
+                        // `VICTORY_HALF_IO=1`: 16-bit elements between
+                        // stages stay 16-bit (as under Wine).
+                        half_io: std::env::var("VICTORY_HALF_IO").as_deref() == Ok("1"),
+                        ..Default::default()
+                    };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
@@ -620,6 +647,12 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            // `VICTORY_READING_PS=1`: against a pixel shader reading every
+            // output, as the title's do (the stub reads none, so the host
+            // compiler drops the outputs).
+            HwStage::Ms if std::env::var("VICTORY_READING_PS").as_deref() == Ok("1") => {
+                host::reading_ps(&shader).and_then(|ps| h.mesh_pipeline(&shader, &ps).map(drop))
+            }
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };

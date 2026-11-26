@@ -103,6 +103,19 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Of the preparing, by phase, in microseconds since the last frame-rate
+/// line: mirroring descriptors the title wrote, texture uploads for heaps,
+/// the lists' deferred steps, the refreshes left for the end. Timed per
+/// submission (a few dozen a frame), so the sums are true to the clock.
+static PHASE_US: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds the time since `*since` to phase `i` of [`PHASE_US`] and restarts it.
+fn phase(i: usize, since: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    PHASE_US[i].fetch_add((now - *since).as_micros() as u64, Ordering::Relaxed);
+    *since = now;
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -335,6 +348,91 @@ mod tests {
     }
 
     use super::*;
+
+    /// Whether the host makes a heap of memory the process allocated itself
+    /// (`OpenExistingHeapFromAddress`, which Metal's `bytesNoCopy` could
+    /// serve), and if so, whether the GPU reads what the CPU wrote there and
+    /// the CPU sees what the GPU wrote, with no copy in between: what title
+    /// memory would need to skip its host copies (`crate::shadow`). D3DMetal
+    /// 4.0 beta 3 answers `E_NOTIMPL`, so under Wine the copies stay.
+    #[test]
+    fn process_memory_imports_into_a_heap() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        const LEN: usize = 1 << 20;
+        const HALF: usize = LEN / 2;
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u32>();
+        assert!(!p.is_null());
+        // SAFETY: inside the allocation.
+        let mem = unsafe { std::slice::from_raw_parts_mut(p, LEN / 4) };
+        for (i, w) in mem.iter_mut().enumerate() {
+            *w = i as u32 ^ 0xA5A5_0000;
+        }
+        let device3: ID3D12Device3 = host.device.cast().expect("ID3D12Device3");
+        // SAFETY: committed memory of ours, alive until the GPU is done.
+        let heap = unsafe { device3.OpenExistingHeapFromAddress::<ID3D12Heap>(p.cast()) };
+        let heap = match heap {
+            Ok(h) => h,
+            Err(e) => {
+                // SAFETY: our allocation.
+                unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
+                assert!(
+                    crate::shader_cache::under_wine(),
+                    "the host cannot import process memory: {e}"
+                );
+                eprintln!("the host cannot import process memory: {e}");
+                return;
+            }
+        };
+        // SAFETY: a live heap.
+        let hd = unsafe { heap.GetDesc() };
+        eprintln!(
+            "imported: {} bytes, heap type {:?}, cpu pages {:?}, pool {:?}, flags {:?}",
+            hd.SizeInBytes, hd.Properties.Type, hd.Properties.CPUPageProperty, hd.Properties.MemoryPoolPreference, hd.Flags
+        );
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: LEN as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            ..Default::default()
+        };
+        let mut placed: Option<ID3D12Resource> = None;
+        // SAFETY: a buffer over the whole heap.
+        unsafe { host.device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut placed) }
+            .expect("a buffer over the imported heap");
+        let placed = placed.unwrap();
+        let (other, data) = host.shared_buffer(LEN as u64).expect("a host buffer");
+        // SAFETY: the mapped host buffer, LEN bytes.
+        let other_mem = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), LEN / 4) };
+        other_mem.fill(0);
+        for w in &mut other_mem[HALF / 4..] {
+            *w = 0x5A5A_5A5A;
+        }
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; both buffers live past the submission.
+        unsafe {
+            // The GPU reads the first half of process memory, and writes the
+            // second half.
+            list.list.CopyBufferRegion(&other, 0, &placed, 0, HALF as u64);
+            list.list.CopyBufferRegion(&placed, HALF as u64, &other, HALF as u64, HALF as u64);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let read_ok = other_mem[..HALF / 4].iter().enumerate().all(|(i, &w)| w == i as u32 ^ 0xA5A5_0000);
+        let written_ok = mem[HALF / 4..].iter().all(|&w| w == 0x5A5A_5A5A);
+        eprintln!("GPU read the CPU's bytes: {read_ok}; CPU sees the GPU's writes: {written_ok}");
+        drop((placed, heap, other));
+        // SAFETY: our allocation, the GPU done with it.
+        unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
+        assert!(read_ok && written_ok, "imported memory is not shared both ways");
+    }
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
@@ -889,7 +987,9 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        let mut since = started;
         crate::descriptor::sync_heaps();
+        phase(0, &mut since);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -919,6 +1019,7 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        phase(1, &mut since);
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -952,7 +1053,9 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        phase(2, &mut since);
         batch.flush();
+        phase(3, &mut since);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -990,7 +1093,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(20) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i]
@@ -998,9 +1101,11 @@ impl Host {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .len();
+                let pipelines = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 tracing::warn!(
                     ms = started.elapsed().as_millis(),
                     commands,
+                    ?pipelines,
                     "slow host list"
                 );
                 for (ms, op) in runs[i].slowest(frequency, 6) {
@@ -1097,6 +1202,8 @@ impl Host {
                 work();
             }
         }
+        // Textures shaders of this submission found missing.
+        crate::descriptor::make_read_textures();
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -2026,6 +2133,16 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Nothing of the copy changed (most copies at most submissions):
+        // no refresh to keep, do and remember.
+        if shadow.clean() {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
@@ -2570,6 +2687,8 @@ impl Meter {
         });
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
+        let [sync, uploads, steps, flush] =
+            [0, 1, 2, 3].map(|i| PHASE_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
@@ -2585,6 +2704,9 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "preparing by phase: {sync:.1} ms mirroring descriptors, {uploads:.1} uploading                  heap textures, {steps:.1} in the lists' steps, {flush:.1} in the last refreshes"
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(

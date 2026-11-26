@@ -1002,11 +1002,15 @@ fn into_destination(
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
     // it is one the title has not filled yet. The title writes a request's
     // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
-    // result, so a failed one is a model or texture left unwritten.
+    // its own, so a read can start first. Read the list again for a while
+    // before failing: the title never looks at a request's result, so a
+    // failed one is a model or texture left unwritten. In a burst of
+    // requests the title filled the lists about 15 ms after the first read,
+    // so 8 rereads were too few, and sleeps under Wine vary in length, so
+    // the wait is timed instead of counted.
+    let deadline = std::time::Instant::now() + LATE_LIST_WAIT;
     let mut rereads = 0;
-    while pages.contains(&0) && rereads < LATE_LIST_TRIES {
+    while pages.contains(&0) && std::time::Instant::now() < deadline {
         rereads += 1;
         std::thread::sleep(std::time::Duration::from_millis(1));
         pages = list();
@@ -1035,8 +1039,8 @@ fn into_destination(
     Err(E_INVALIDARG)
 }
 
-/// Milliseconds a page list naming page 0 is read again for.
-const LATE_LIST_TRIES: u32 = 8;
+/// How long a page list naming page 0 is read again for.
+const LATE_LIST_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 

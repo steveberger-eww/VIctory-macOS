@@ -480,6 +480,12 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether [`Shadow::update`] of any range would copy nothing: tracked
+    /// memory none of whose pages changed since they were taken.
+    pub(crate) fn clean(&self) -> bool {
+        self.tracked.as_ref().is_some_and(|t| t.clean())
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -487,6 +493,23 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            return 0;
+        }
+        // Nothing the title wrote since its pages were taken: nothing to
+        // copy, around the ranges shaders write or under them. Most
+        // refreshes in the world end here; asked piece by piece between the
+        // ranges shaders write, an unchanged copy cost about 9 checks (some
+        // 220,000 per frame).
+        if let Some(t) = &self.tracked
+            && !t.any_changed(from, to)
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Watches, 1);
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
             return 0;
         }
         let mut busy: Vec<(usize, usize)> = self
@@ -710,6 +733,29 @@ fn bitmap() -> Option<&'static Bitmap> {
         .as_ref()
 }
 
+/// The resource-heap slots whose textures shaders found empty since the
+/// last call (`victory_shader::emit`, "Read marks"), their marks cleared.
+/// Between submissions only.
+pub(crate) fn take_read_marks() -> Vec<u32> {
+    let Some(b) = bitmap() else {
+        return Vec::new();
+    };
+    let at = victory_shader::emit::READ_MARKS_AT as usize;
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    // SAFETY: the mapped buffer's read marks; the GPU is done with them (one
+    // submission runs at a time).
+    let bits = unsafe { std::slice::from_raw_parts_mut((b.data + at) as *mut u32, words) };
+    let mut slots = Vec::new();
+    for (w, word) in bits.iter_mut().enumerate().filter(|(_, word)| **word != 0) {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            slots.push((w * 32) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    slots
+}
+
 /// The host GPU address of the buffer views' written-pages bitmap, for the
 /// root UAV of shaders that mark their writes.
 pub(crate) fn view_writes() -> Option<u64> {
@@ -869,21 +915,33 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// gets copies of the aligned windows it touches. Windows never overlap: a
+/// range that reaches past the windows holding it gets one window covering
+/// them all, which replaces them. Overlapping windows each had a copy of
+/// their own, and in the story's first minutes Grand Theft Auto VI made
+/// 2,000 of them, 10.4 GB in all, for memory far smaller than that. Windows
+/// are 1 MiB: 4 MiB ones left 5.4 GB of copies once merged, much of it
+/// padding around a few bytes of interface vertices.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+/// shortcut: a replaced window's shader writes that a submission still
+/// running has not copied back yet may be missing from the window that
+/// replaces it, until the title writes those pages again.
+const WINDOW: u64 = 1 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
+/// Copies of title memory outside buffers, by (start, length), disjoint.
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    // The windows are disjoint, so only the last one starting at or below
+    // `address` can hold the range.
+    if let Some((&(start, len), shadow)) = map.range(..=(address, u64::MAX)).next_back()
+        && start + len >= end
+    {
         return Some(shadow.clone());
     }
+    let (start, len, overlapping) = window(&map, address, end);
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -891,12 +949,37 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
+        replaced = overlapping.len(),
         "loose memory copied to the host"
     );
+    // Lists that still hold a replaced window keep it until they are reset.
+    for key in &overlapping {
+        map.remove(key);
+    }
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
+}
+
+/// The window to copy for `[address, end)` among the disjoint windows
+/// `map` holds: its start and length, and the windows it replaces.
+fn window<T>(map: &BTreeMap<(u64, u64), T>, address: u64, end: u64) -> (u64, u64, Vec<(u64, u64)>) {
+    let (mut start, mut stop) = (address & !(WINDOW - 1), end.next_multiple_of(WINDOW));
+    // Windows starting before `stop`, last first: those from `start` on
+    // overlap, and of those before it only the last can.
+    let overlapping: Vec<(u64, u64)> = map
+        .range(..(stop, 0))
+        .rev()
+        .take_while(|(k, _)| k.0 >= start || k.0 + k.1 > start)
+        .filter(|(k, _)| k.0 + k.1 > start)
+        .map(|(k, _)| *k)
+        .collect();
+    for &(s, l) in &overlapping {
+        start = start.min(s);
+        stop = stop.max(s + l);
+    }
+    (start, stop - start, overlapping)
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -989,6 +1072,56 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
     all
 }
 
+/// What [`all`] holds, for finding where copies' memory goes
+/// (diagnostics): copies of buffers, the title bytes they cover (overlapping
+/// buffers each have a copy of their own, so the copies can hold more than
+/// they cover), the largest, and copies of windows outside buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn breakdown() -> String {
+    let mut ranges: Vec<(u64, u64)> = buffers()
+        .iter()
+        .filter(|(_, e)| e.shadow.is_some())
+        .map(|(k, e)| (k.0, e.end))
+        .collect();
+    let (n, bytes) = (ranges.len(), ranges.iter().map(|r| r.1 - r.0).sum::<u64>());
+    let largest = ranges.iter().map(|r| r.1 - r.0).max().unwrap_or(0);
+    ranges.sort_unstable();
+    // The title memory buffers cover, as disjoint ranges in order.
+    let mut union: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        match union.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => union.push((start, end)),
+        }
+    }
+    let covered: u64 = union.iter().map(|r| r.1 - r.0).sum();
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose_bytes: u64 = loose.keys().map(|k| k.1).sum();
+    // Window bytes a buffer's copy also holds: a window made where `find`
+    // missed the buffer around it.
+    let doubled: u64 = loose
+        .keys()
+        .map(|&(start, len)| {
+            let end = start + len;
+            let first = union.partition_point(|r| r.1 <= start);
+            union[first..]
+                .iter()
+                .take_while(|r| r.0 < end)
+                .map(|r| r.1.min(end) - r.0.max(start))
+                .sum::<u64>()
+        })
+        .sum();
+    format!(
+        "host copies by kind: buffers {n} ({:.1} MB, covering {:.1} MB of title memory, largest {:.1} MB); windows outside buffers {} ({:.1} MB, {:.1} MB of it also in buffers' copies)",
+        bytes as f64 / 1e6,
+        covered as f64 / 1e6,
+        largest as f64 / 1e6,
+        loose.len(),
+        loose_bytes as f64 / 1e6,
+        doubled as f64 / 1e6
+    )
+}
+
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
@@ -1024,6 +1157,26 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A range reaching past its window gets one window over every window
+    /// it touches, and a range inside a window makes none.
+    #[test]
+    fn windows_outside_buffers_are_merged() {
+        const M: u64 = WINDOW;
+        let mut map = BTreeMap::new();
+        assert_eq!(window(&map, 5 * M + 8, 5 * M + 16), (5 * M, M, vec![]));
+        map.insert((5 * M, M), ());
+        map.insert((8 * M, 2 * M), ());
+        map.insert((20 * M, M), ());
+        // From the window at 5 into the one at 8: both go, 5 to 10 comes.
+        assert_eq!(window(&map, 5 * M + 1, 8 * M + 1), (5 * M, 5 * M, vec![(8 * M, 2 * M), (5 * M, M)]));
+        // Starting inside the one at 8 and going past it.
+        assert_eq!(window(&map, 9 * M, 11 * M + 1), (8 * M, 4 * M, vec![(8 * M, 2 * M)]));
+        // Next to windows but in none of them.
+        assert_eq!(window(&map, 6 * M, 7 * M), (6 * M, M, vec![]));
+        // Over all three.
+        assert_eq!(window(&map, 4 * M, 21 * M).2.len(), 3);
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the

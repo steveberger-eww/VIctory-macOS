@@ -1670,6 +1670,33 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     resource(out).host.is_some().then_some(out)
 }
 
+/// What [`PLACED_TEXTURES`] holds (diagnostics): its textures and their
+/// bytes, and those whose memory a texture at a later address also covers
+/// (memory the title reused for another texture: the older one is dead if
+/// no slot views it any more).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_summary() -> String {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut bytes, mut overlapped, mut overlapped_bytes, mut reach) = (0u64, 0usize, 0u64, 0u64);
+    for &(address, words) in map.keys() {
+        // SAFETY: 56 bytes in the description's layout.
+        let d = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        let size = footprint(&d).map_or(0, |info| info.size);
+        bytes += size;
+        if address < reach {
+            overlapped += 1;
+            overlapped_bytes += size;
+        }
+        reach = reach.max(address + size);
+    }
+    format!(
+        "placed textures: {} ({:.1} MB), {overlapped} overlapping an earlier one ({:.1} MB)",
+        map.len(),
+        bytes as f64 / 1e6,
+        overlapped_bytes as f64 / 1e6
+    )
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,

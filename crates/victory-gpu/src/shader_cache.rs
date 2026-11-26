@@ -103,6 +103,20 @@ fn bias_as_gradients() -> bool {
     })
 }
 
+/// Whether the host runs 32-lane waves only, so translations refuse console
+/// wave64 programs that need 64 (`emit::Options::wave32_host`): under Wine,
+/// whose D3DMetal reports 32 lanes and runs nothing in a `WaveSize(64)`
+/// pipeline. `VICTORY_WAVE32_HOST=0` or `1` overrides.
+/// shortcut: decided by Wine, not by the device's `WaveLaneCountMax`.
+fn wave32_host() -> bool {
+    static WAVE32: OnceLock<bool> = OnceLock::new();
+    *WAVE32.get_or_init(|| match std::env::var("VICTORY_WAVE32_HOST").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -123,10 +137,16 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
-    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
+/// as gradients, a 32-lane host): their own cache entries, one per
+/// combination.
+fn options_build(locks: bool, bias: bool, wave32: bool, halves: bool, half_io: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    let n = usize::from(locks)
+        | usize::from(bias) << 1
+        | usize::from(wave32) << 2
+        | usize::from(halves) << 3
+        | usize::from(half_io) << 4;
+    BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
@@ -134,6 +154,15 @@ fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
         }
         if bias {
             h.update(b"bias as gradients");
+        }
+        if wave32 {
+            h.update(b"32-lane host");
+        }
+        if halves {
+            h.update(b"wave64 as halves");
+        }
+        if half_io {
+            h.update(b"16-bit elements");
         }
         *h.finalize().as_bytes()
     })
@@ -146,21 +175,41 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // (`crate::shadow::copy_back_marks`).
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
     // leave the texels untouched (`emit`, "Atomic locks").
-    let options = victory_shader::emit::Options {
-        view_marks: true,
-        atomic_locks: atomic_locks(),
-        bias_as_gradients: bias_as_gradients(),
-    };
+    let options = options();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients {
-        options_build(options.atomic_locks, options.bias_as_gradients)
+    let build = if options.atomic_locks || options.bias_as_gradients || options.wave32_host || options.half_io {
+        options_build(
+            options.atomic_locks,
+            options.bias_as_gradients,
+            options.wave32_host,
+            options.wave32_host && options.wave64_halves,
+            options.half_io,
+        )
     } else {
         build()
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),
+    }
+}
+
+/// How this host's translations are made.
+fn options() -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        view_marks: true,
+        atomic_locks: atomic_locks(),
+        bias_as_gradients: bias_as_gradients(),
+        wave32_host: wave32_host(),
+        wave64_halves: std::env::var("VICTORY_WAVE64_HALVES").as_deref() == Ok("1"),
+        // Under Wine: Metal's mesh output limit (`emit::Options::half_io`).
+        // `VICTORY_HALF_IO=0` or `1` overrides.
+        half_io: match std::env::var("VICTORY_HALF_IO").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => under_wine(),
+        },
     }
 }
 

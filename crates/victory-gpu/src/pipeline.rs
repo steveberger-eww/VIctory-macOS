@@ -87,9 +87,16 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        // Diagnostics: `VICTORY_DUMP_SHADERS=<folder>` keeps each container
+        // the title hands over as `<hash>.bin` (for `shader-info --disasm`).
+        #[cfg(feature = "diagnostics")]
+        if let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS") {
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{hash}.bin")), bytes);
+        }
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash,
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),

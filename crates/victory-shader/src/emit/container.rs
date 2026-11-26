@@ -54,6 +54,7 @@ impl SigElement {
             1 | 5 => 1, // bool and u32
             4 => 2,
             9 => 3,
+            8 => 6, // a 16-bit float
             _ => 0,
         }
     }

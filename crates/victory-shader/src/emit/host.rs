@@ -21,7 +21,14 @@ pub struct Host {
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
     match c.part(fourcc) {
-        Some(p) => super::signature(p.data).map_err(|e| e.to_string()),
+        // 16-bit floats as the host shader declares them
+        // ([`Options::half_io`](super::Options)).
+        Some(p) => super::signature(p.data).map_err(|e| e.to_string()).map(|mut elements| {
+            for e in elements.iter_mut().filter(|e| e.half && e.comp == 9) {
+                e.comp = 8;
+            }
+            elements
+        }),
         None => Ok(Vec::new()),
     }
 }
@@ -750,6 +757,9 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        wave32_host: false,
+        wave64_halves: false,
+        half_io: false,
         view_marks: false,
     })?;
     Ok(HostShader {
@@ -817,16 +827,82 @@ pub fn stub_ps() -> HostShader {
     stub(true, vec![target])
 }
 
+/// A pixel shader that reads every generic output of the vertex or mesh
+/// shader `vs` and writes their bits, combined, to target 0: unlike
+/// [`stub_ps`], the host's compiler keeps all of `vs`'s outputs, as a real
+/// pixel shader reading them does (diagnostics: `translate --pipelines`
+/// with `VICTORY_READING_PS=1`).
+pub fn reading_ps(vs: &HostShader) -> Result<HostShader, String> {
+    use super::bitcode::{Attr, Bin, Cast, Term};
+    let inputs: Vec<SigElement> = sig(&vs.dxil, FourCC::OSG1)?
+        .into_iter()
+        .filter(|e| e.kind == 0 && e.row.is_some())
+        .map(|mut e| {
+            e.interp = if e.comp >= 8 { 2 } else { 1 };
+            e.usage = (1 << e.cols) - 1;
+            e
+        })
+        .collect();
+    let mut s = super::shader::Shader::new(true);
+    let b = s.entry;
+    let mut acc = s.m.i32(0);
+    for (id, e) in inputs.iter().enumerate() {
+        for col in 0..e.cols {
+            let float = e.comp == 9;
+            let (suffix, ty) = match e.comp {
+                8 => (".f16", s.m.half()),
+                9 => (".f32", s.t.f32),
+                _ => (".i32", s.t.i32),
+            };
+            let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            let mut v = s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
+            if float {
+                v = s.m.cast(b, Cast::Bitcast, v, s.t.i32);
+            } else if e.comp == 8 {
+                let i16t = s.m.int(16);
+                v = s.m.cast(b, Cast::Bitcast, v, i16t);
+                v = s.m.cast(b, Cast::ZExt, v, s.t.i32);
+            }
+            acc = s.m.bin(b, Bin::Xor, acc, v);
+        }
+    }
+    let out = s.m.cast(b, Cast::Bitcast, acc, s.t.f32);
+    for col in 0..4u8 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), out];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.inputs = inputs;
+    s.outputs = vec![SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    }];
+    s.m.terminate(b, Term::Ret);
+    let mut h = stub_ps();
+    h.dxil = s.finish();
+    Ok(h)
+}
+
 fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
     let b = s.entry;
     for (id, e) in outputs.iter().enumerate() {
         for col in 0..e.cols {
-            let (suffix, zero) = if e.comp == 9 {
-                (".f32", s.m.f32(0))
-            } else {
-                (".i32", s.m.i32(0))
+            let (suffix, zero) = match e.comp {
+                8 => {
+                    let half = s.m.half();
+                    (".f16", s.m.undef(half))
+                }
+                9 => (".f32", s.m.f32(0)),
+                _ => (".i32", s.m.i32(0)),
             };
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), zero];
             s.op(

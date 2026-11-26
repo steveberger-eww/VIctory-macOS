@@ -100,7 +100,12 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+///
+/// The flag is false only while the set is empty, so that a tracker with
+/// nothing changed answers without the lock ([`Tracked::clean`]): it is set
+/// under the set's lock with each page marked, and cleared under it by a
+/// look that finds the set empty.
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, std::sync::atomic::AtomicBool);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -314,7 +319,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default(), true.into()));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -439,6 +444,33 @@ impl Tracked {
             }
         }
         runs
+    }
+
+    /// Whether no page at all changed since it was taken. Most trackers
+    /// most of the time, and asked of every host copy at every submission
+    /// (some 200,000 times a frame in the world): answered from a flag,
+    /// without the lock.
+    pub(crate) fn clean(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.changed.2.load(Relaxed) {
+            return true;
+        }
+        let set = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        if set.is_empty() {
+            self.changed.2.store(false, Relaxed);
+        }
+        set.is_empty()
+    }
+
+    /// Whether any page of `[from, to)` changed since it was taken: where
+    /// none did, [`Tracked::take`] has nothing to give for any part of it.
+    pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && (self.changed.0.lock().unwrap_or_else(|e| e.into_inner()))
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -636,7 +668,11 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let first_write = {
+                let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+                c.2.store(true, std::sync::atomic::Ordering::Relaxed);
+                set.insert(page)
+            };
             if first_write && save {
                 c.save(page);
             }
